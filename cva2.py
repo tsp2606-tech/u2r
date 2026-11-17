@@ -3,9 +3,8 @@ CVa 2 v2 — Python Controller for RP2040DongleV2
 Capture Engine: mss + OpenCV HSV (Tối ưu hóa thị giác máy tính)
 Hardware Target: Waveshare RP2040-Zero (VXE R1 SE+ Dongle)
 Features:
-  - Vùng quét FOV xung quanh tâm ngắm (Crosshair ROI)
+  - Vùng quét FOV 3x3px xung quanh tâm ngắm (Crosshair ROI)
   - Không gian màu HSV lọc chuẩn xác (Yellow / Purple / Red)
-  - Mặt nạ vùng kích hoạt (Trigger Zone: Vùng đầu + Tâm ngắm)
   - Cáp USB hoàn toàn im lặng khi ngắm (0 byte/s), chỉ bắn 4 byte khi thấy mục tiêu
   - Giao thức nhị phân mã hóa XOR 4-byte tương thích 100% với RP2040DongleV2
 """
@@ -78,23 +77,25 @@ HSV_PRESETS = {
 # Bộ Chụp Màn Hình & Lọc Màu: mss + OpenCV HSV
 # =========================================================================
 class MSSColorDetector:
-    def __init__(self, fov_size=50):
+    def __init__(self, fov_size=3, min_hits=2):
         self.fov_size = fov_size
+        self.min_hits = min_hits
         self.sct = mss.MSS()
         self.kernel = np.ones((3, 3), np.uint8)
 
-        # Tạo mặt nạ vùng ngắm bắn (Trigger Zone):
-        # 1. Hình tròn bán kính 10px quanh tâm
-        # 2. Cột thẳng đứng phía trên (Upper Head) để bắt đầu địch khi kê góc
-        cx = fov_size // 2
-        cy = fov_size // 2
-        Y, X = np.ogrid[:fov_size, :fov_size]
-        circle = (X - cx)**2 + (Y - cy)**2 <= 11**2
-        head_col = (np.abs(X - cx) <= 4) & (Y - cy >= -22) & (Y - cy <= 0)
-        self.trigger_mask = circle | head_col
+        # Với FOV nhỏ (như 3x3px), toàn bộ vùng quét chính là vùng tâm kích hoạt
+        if fov_size <= 5:
+            self.trigger_mask = np.ones((fov_size, fov_size), dtype=bool)
+        else:
+            cx = fov_size // 2
+            cy = fov_size // 2
+            Y, X = np.ogrid[:fov_size, :fov_size]
+            circle = (X - cx)**2 + (Y - cy)**2 <= 11**2
+            head_col = (np.abs(X - cx) <= 4) & (Y - cy >= -22) & (Y - cy <= 0)
+            self.trigger_mask = circle | head_col
 
     def get_grab_region(self, center_x, center_y):
-        half = self.fov_size // 2
+        half = self.fov_size // 2  # Với fov_size=3 -> half=1 (lấy từ tâm -1 đến +1)
         return {
             "top": int(center_y - half),
             "left": int(center_x - half),
@@ -103,7 +104,7 @@ class MSSColorDetector:
         }
 
     def scan_for_color(self, region, color_mode):
-        # 1. Chụp ảnh qua mss
+        # 1. Chụp ảnh vùng 3x3px qua mss
         shot = self.sct.grab(region)
         arr = np.frombuffer(shot.raw, dtype=np.uint8).reshape((self.fov_size, self.fov_size, 4))
         bgr = arr[:, :, :3]
@@ -121,15 +122,16 @@ class MSSColorDetector:
             p = HSV_PRESETS.get(color_mode, HSV_PRESETS[0])
             color_mask = cv2.inRange(hsv, p["lower"], p["upper"])
 
-        # 4. Xử lý hình thái học (Morphology) để làm mịn và lọc nhiễu
-        color_mask = cv2.morphologyEx(color_mask, cv2.MORPH_CLOSE, self.kernel)
+        # 4. Chỉ dùng Morphology khi FOV lớn để tránh méo biên trên ma trận 3x3
+        if self.fov_size > 5:
+            color_mask = cv2.morphologyEx(color_mask, cv2.MORPH_CLOSE, self.kernel)
 
-        # 5. Áp dụng mặt nạ vùng ngắm (Chỉ kích hoạt nếu màu nằm trong vùng tâm/đầu ngắm)
+        # 5. Áp dụng mặt nạ vùng ngắm
         target_in_zone = color_mask & self.trigger_mask
 
-        # 6. Đếm số điểm ảnh hợp lệ (Ngưỡng tối thiểu 2 pixel để loại bỏ hạt nhiễu)
+        # 6. Đếm số điểm ảnh hợp lệ trong 9 pixel (mặc định >= 2 pixel)
         hits = np.count_nonzero(target_in_zone)
-        return hits >= 2
+        return hits >= self.min_hits
 
     def close(self):
         self.sct.close()
@@ -188,9 +190,9 @@ def main():
     center_y = screen_h // 2
     print(f"[SCREEN] Do phan giai: {screen_w}x{screen_h} (Tam ngam: {center_x}, {center_y})")
 
-    detector = MSSColorDetector(fov_size=50)
+    detector = MSSColorDetector(fov_size=3, min_hits=2)
     region = detector.get_grab_region(center_x, center_y)
-    print(f"[CAPTURE] Khoi tao mss + OpenCV HSV (Vung FOV: 50x50 quanh tam)")
+    print(f"[CAPTURE] Khoi tao mss + OpenCV HSV (Vung FOV: {detector.fov_size}x{detector.fov_size} quanh tam)")
 
     ser = find_and_connect_rp2040()
     if ser:
@@ -296,7 +298,7 @@ def main():
                         send_4byte_packet(ser, OP_CLICK, nonce)
                         nonce = (nonce + 1) & 0xFF
                         next_click_time = now + CLICK_PERIOD_SEC
-                        print(f"[CLICK] Muc tieu {HSV_PRESETS[color_mode]['name']} lọt vao tam -> Ban click phan cung tai {now:.3f}s")
+                        print(f"[CLICK] Muc tieu {HSV_PRESETS[color_mode]['name']} lot vao tam -> Ban click phan cung tai {now:.3f}s")
                     except Exception as e:
                         print(f"[ERROR] Loi gui Serial: {e}")
                         ser = None
