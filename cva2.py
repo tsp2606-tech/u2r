@@ -1,24 +1,22 @@
 """
 CVa 2 v2 — Python Controller for RP2040DongleV2
-Capture Engine: mss + OpenCV HSV (Tối ưu hóa thị giác máy tính)
-Hardware Target: Waveshare RP2040-Zero (VXE R1 SE+ Dongle)
-Features:
-  - Vùng quét FOV 3x3px xung quanh tâm ngắm (Crosshair ROI)
-  - Không gian màu HSV lọc chuẩn xác (Yellow / Purple / Red)
-  - Cáp USB hoàn toàn im lặng khi ngắm (0 byte/s), chỉ bắn 4 byte khi thấy mục tiêu
-  - Giao thức nhị phân mã hóa XOR 4-byte tương thích 100% với RP2040DongleV2
+Capture Engine: mss (Siêu nhẹ, không dùng BitBlt)
+Scanning Algorithm: Chuẩn 100% 3 Tầng Ưu Tiên Của Dự Án Cũ CVa
+  - Tầng 1: Tâm ngắm 3x3 px (Ưu tiên số 1)
+  - Tầng 2: Cột đầu dọc phía trên 24px (Upper Vertical Comb)
+  - Tầng 3: 16 tia Starburst tỏa tròn 360 độ (bảng tra Sin/Cos)
+Color Math: Đại số số nguyên không phép chia (Zero-Division Integer) nguyên bản CVa
+Zero-Jitter: Không flush buffer, không log nghẽn console, chuột lướt mượt 1000Hz tuyệt đối
 """
 
 import sys
 import time
-import json
+import math
 import ctypes
 from ctypes import wintypes
 import serial
 import serial.tools.list_ports
 import winsound
-import numpy as np
-import cv2
 import mss
 
 # Khắc phục Windows DPI Scaling
@@ -37,6 +35,8 @@ OP_ACCEL_ON = 0x04
 OP_ACCEL_OFF= 0x05
 
 CLICK_PERIOD_SEC = 0.060  # Hồi 60ms giữa 2 lần click
+SCAN_RADIUS = 25
+RECT_SIZE = SCAN_RADIUS * 2  # 50x50 pixel
 
 # Win32 Virtual Key Codes
 VK_RBUTTON = 0x02
@@ -50,101 +50,173 @@ VK_PAGEDOWN= 0x22
 user32 = ctypes.windll.user32
 
 # =========================================================================
-# Bảng Không Gian Màu HSV (Hue - Saturation - Value)
+# Bảng Tra 16 Tia Starburst (Chuẩn 100% Dự Án Cũ CVa)
 # =========================================================================
-# Hue: 0-180, Saturation: 0-255, Value: 0-255 trong OpenCV
-HSV_PRESETS = {
-    0: {  # Yellow (Vàng)
-        "name": "YELLOW (Default)",
-        "lower": np.array([25, 80, 80], dtype=np.uint8),
-        "upper": np.array([35, 255, 255], dtype=np.uint8),
-    },
-    1: {  # Purple / Magenta (Tím)
-        "name": "PURPLE",
-        "lower": np.array([130, 60, 70], dtype=np.uint8),
-        "upper": np.array([165, 255, 255], dtype=np.uint8),
-    },
-    2: {  # Red (Đỏ)
-        "name": "RED",
-        "lower1": np.array([0, 90, 90], dtype=np.uint8),
-        "upper1": np.array([10, 255, 255], dtype=np.uint8),
-        "lower2": np.array([170, 90, 90], dtype=np.uint8),
-        "upper2": np.array([180, 255, 255], dtype=np.uint8),
-    }
-}
+STAR_BURST_RAYS = [
+    ( 0.000, -1.000),
+    ( 0.383, -0.924),
+    ( 0.707, -0.707),
+    ( 0.924, -0.383),
+    ( 1.000,  0.000),
+    ( 0.924,  0.383),
+    ( 0.707,  0.707),
+    ( 0.383,  0.924),
+    ( 0.000,  1.000),
+    (-0.383,  0.924),
+    (-0.707,  0.707),
+    (-0.924,  0.383),
+    (-1.000,  0.000),
+    (-0.924, -0.383),
+    (-0.707, -0.707),
+    (-0.383, -0.924),
+]
+
+class RayOffsets:
+    def __init__(self, radius=SCAN_RADIUS):
+        self.offsets = []
+        for i in range(16):
+            ray_list = []
+            dx_f, dy_f = STAR_BURST_RAYS[i]
+            for r in range(radius):
+                rx = int(round(r * dx_f))
+                ry = int(round(r * dy_f))
+                ray_list.append((rx, ry))
+            self.offsets.append(ray_list)
 
 # =========================================================================
-# Bộ Chụp Màn Hình & Lọc Màu: mss + OpenCV HSV
+# Thuật Toán Nhận Diện Màu Sắc Thuần Số Nguyên (Chuẩn 100% CVa Cũ)
 # =========================================================================
-class MSSColorDetector:
-    def __init__(self, fov_size=3, min_hits=2):
-        self.fov_size = fov_size
-        self.min_hits = min_hits
+def is_yellow(r, g, b):
+    if g < 120 or r < 110 or b > 125:
+        return False
+    gb = g - b
+    rb = r - b
+    if gb < 25 or rb < 15:
+        return False
+    if (g * 100) < (r * 82) or (r * 100) < (g * 70):
+        return False
+    if g >= r:
+        return (6 * rb <= 7 * gb) and (5 * rb >= 4 * gb)
+    else:
+        return (6 * gb >= 5 * rb) and (5 * gb <= 6 * rb)
+
+def is_purple(r, g, b):
+    if r < 75 or b < 75:
+        return False
+    rg = r - g
+    bg = b - g
+    if rg < 20 or bg < 12:
+        return False
+    if r >= b:
+        return (25 * rg <= 60 * bg) and (60 * bg <= 90 * rg)
+    else:
+        return (30 * bg <= 60 * rg) and (60 * bg <= 95 * bg)
+
+def is_red(r, g, b):
+    if r < 130 or g > 110 or b > 110:
+        return False
+    return (r - g >= 40) and (r - b >= 40)
+
+def is_target_pixel(raw_bytes, idx, color_mode):
+    # mss trả về buffer BGRA 4 kênh
+    b = raw_bytes[idx]
+    g = raw_bytes[idx + 1]
+    r = raw_bytes[idx + 2]
+    if color_mode == 0:
+        return is_yellow(r, g, b)
+    elif color_mode == 1:
+        return is_purple(r, g, b)
+    elif color_mode == 2:
+        return is_red(r, g, b)
+    return False
+
+# =========================================================================
+# Cỗ Máy Quét 3 Tầng Ưu Tiên Chuẩn CVa (Dùng mss, Không Dùng BitBlt)
+# =========================================================================
+class CVa3TierScanner:
+    def __init__(self, rect_size=RECT_SIZE):
+        self.rect_size = rect_size
         self.sct = mss.MSS()
-        self.kernel = np.ones((3, 3), np.uint8)
-
-        # Với FOV nhỏ (như 3x3px), toàn bộ vùng quét chính là vùng tâm kích hoạt
-        if fov_size <= 5:
-            self.trigger_mask = np.ones((fov_size, fov_size), dtype=bool)
-        else:
-            cx = fov_size // 2
-            cy = fov_size // 2
-            Y, X = np.ogrid[:fov_size, :fov_size]
-            circle = (X - cx)**2 + (Y - cy)**2 <= 11**2
-            head_col = (np.abs(X - cx) <= 4) & (Y - cy >= -22) & (Y - cy <= 0)
-            self.trigger_mask = circle | head_col
+        self.ray_offsets = RayOffsets(SCAN_RADIUS)
 
     def get_grab_region(self, center_x, center_y):
-        half = self.fov_size // 2  # Với fov_size=3 -> half=1 (lấy từ tâm -1 đến +1)
+        half = self.rect_size // 2
         return {
             "top": int(center_y - half),
             "left": int(center_x - half),
-            "width": int(self.fov_size),
-            "height": int(self.fov_size)
+            "width": int(self.rect_size),
+            "height": int(self.rect_size)
         }
 
     def scan_for_color(self, region, color_mode):
-        # 1. Chụp ảnh vùng 3x3px qua mss
+        # Chụp vùng FOV 50x50 bằng mss siêu nhẹ
         shot = self.sct.grab(region)
-        arr = np.frombuffer(shot.raw, dtype=np.uint8).reshape((self.fov_size, self.fov_size, 4))
-        bgr = arr[:, :, :3]
+        raw_bytes = shot.raw
+        rect_size = self.rect_size
 
-        # 2. Chuyển sang không gian màu HSV
-        hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+        cx = rect_size // 2
+        cy = rect_size // 2
 
-        # 3. Lọc theo ngưỡng dải màu
-        if color_mode == 2:  # Chế độ Đỏ (2 dải)
-            p = HSV_PRESETS[2]
-            mask1 = cv2.inRange(hsv, p["lower1"], p["upper1"])
-            mask2 = cv2.inRange(hsv, p["lower2"], p["upper2"])
-            color_mask = cv2.bitwise_or(mask1, mask2)
-        else:
-            p = HSV_PRESETS.get(color_mode, HSV_PRESETS[0])
-            color_mask = cv2.inRange(hsv, p["lower"], p["upper"])
+        # -------------------------------------------------------------
+        # TẦNG 1: Tâm Ngắm (Center 3x3 px) — Ưu tiên số 1
+        # -------------------------------------------------------------
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                idx = ((cy + dy) * rect_size + (cx + dx)) * 4
+                if is_target_pixel(raw_bytes, idx, color_mode):
+                    return True
 
-        # 4. Chỉ dùng Morphology khi FOV lớn để tránh méo biên trên ma trận 3x3
-        if self.fov_size > 5:
-            color_mask = cv2.morphologyEx(color_mask, cv2.MORPH_CLOSE, self.kernel)
+        # -------------------------------------------------------------
+        # TẦNG 2: Cột Đầu Địch Kê Góc (Upper Vertical Comb) — Ưu tiên số 2
+        # dx ∈ [-2..2], dy ∈ [-24..-1] quét ngược từ trên xuống dưới
+        # -------------------------------------------------------------
+        for dy in range(-SCAN_RADIUS + 1, 0):  # -24 đến -1
+            for dx in (-2, -1, 0, 1, 2):
+                idx = ((cy + dy) * rect_size + (cx + dx)) * 4
+                if is_target_pixel(raw_bytes, idx, color_mode):
+                    return True
 
-        # 5. Áp dụng mặt nạ vùng ngắm
-        target_in_zone = color_mask & self.trigger_mask
+        # -------------------------------------------------------------
+        # TẦNG 3: 16 Tia Phóng Nan Hoa (16 Star-burst Rays) — Ưu tiên số 3
+        # -------------------------------------------------------------
+        hit_count = 0
+        min_hit_dist = SCAN_RADIUS
+        closest_ray = -1
 
-        # 6. Đếm số điểm ảnh hợp lệ trong 9 pixel (mặc định >= 2 pixel)
-        hits = np.count_nonzero(target_in_zone)
-        return hits >= self.min_hits
+        for i in range(16):
+            ray = self.ray_offsets.offsets[i]
+            for r in range(1, SCAN_RADIUS):
+                rx, ry = ray[r]
+                px = cx + rx
+                py = cy + ry
+                if 0 <= px < rect_size and 0 <= py < rect_size:
+                    idx = (py * rect_size + px) * 4
+                    if is_target_pixel(raw_bytes, idx, color_mode):
+                        hit_count += 1
+                        if r < min_hit_dist:
+                            min_hit_dist = r
+                            closest_ray = i
+                        break
+
+        # Nếu có từ 2 tia chạm màu và mục tiêu nằm sát tâm (khoảng cách <= 2px)
+        if hit_count >= 2 and closest_ray != -1:
+            if min_hit_dist <= 2:
+                return True
+
+        return False
 
     def close(self):
         self.sct.close()
 
 # =========================================================================
-# Giao Tiếp Phần Cứng Với RP2040 (Cổng COM Tự Động Kết Nối)
+# Giao Tiếp Phần Cứng Với RP2040 (Non-blocking, Không Flush, Không Khựng)
 # =========================================================================
 def send_4byte_packet(ser, opcode, nonce):
     enc_op = opcode ^ PROTO_KEY ^ nonce
     checksum = (PROTO_MAGIC + enc_op + nonce) & 0xFF
     packet = bytes([PROTO_MAGIC, enc_op, nonce, checksum])
     ser.write(packet)
-    ser.flush()
+    # KHÔNG gọi ser.flush() để tránh block luồng CPU gây giật khựng chuột
 
 def find_and_connect_rp2040():
     ports = sorted(
@@ -175,12 +247,18 @@ def play_sound(enabled):
     freq = 1000 if enabled else 400
     winsound.Beep(freq, 70)
 
+COLOR_NAMES = {
+    0: "YELLOW (Default)",
+    1: "PURPLE",
+    2: "RED"
+}
+
 # =========================================================================
 # Vòng Lặp Thực Thi Chính
 # =========================================================================
 def main():
     print("=" * 65)
-    print("  CVa 2 v2 — Python Controller (mss + OpenCV HSV Engine)")
+    print("  CVa 2 v2 — Python Controller (mss + Exact CVa 3-Tier Scan)")
     print("  Hardware Target: Waveshare RP2040-Zero (VXE R1 SE+ Dongle)")
     print("=" * 65)
 
@@ -190,9 +268,9 @@ def main():
     center_y = screen_h // 2
     print(f"[SCREEN] Do phan giai: {screen_w}x{screen_h} (Tam ngam: {center_x}, {center_y})")
 
-    detector = MSSColorDetector(fov_size=3, min_hits=2)
-    region = detector.get_grab_region(center_x, center_y)
-    print(f"[CAPTURE] Khoi tao mss + OpenCV HSV (Vung FOV: {detector.fov_size}x{detector.fov_size} quanh tam)")
+    scanner = CVa3TierScanner(rect_size=RECT_SIZE)
+    region = scanner.get_grab_region(center_x, center_y)
+    print(f"[CAPTURE] Khoi tao mss + CVa 3-Tier Scan (Vung FOV: {RECT_SIZE}x{RECT_SIZE} quanh tam, khong dung BitBlt)")
 
     ser = find_and_connect_rp2040()
     if ser:
@@ -218,7 +296,7 @@ def main():
     print("  - [`~] (Backtick): Bat/tat chan ban khi di chuyen A/D (Counter-strafe)")
     print("  - [PageUp]: Bat/tat gia toc chuot phan cung (Raw Accel)")
     print("  - [End]: Tat chuong trinh\n")
-    print(f"[READY] Mau dang chon: {HSV_PRESETS[color_mode]['name']}")
+    print(f"[READY] Mau dang chon: {COLOR_NAMES[color_mode]}")
 
     try:
         while True:
@@ -238,7 +316,7 @@ def main():
                     screen_w, screen_h = cur_w, cur_h
                     center_x = screen_w // 2
                     center_y = screen_h // 2
-                    region = detector.get_grab_region(center_x, center_y)
+                    region = scanner.get_grab_region(center_x, center_y)
                     print(f"[SCREEN] Cap nhat do phan giai: {screen_w}x{screen_h} (Tam: {center_x}, {center_y})")
 
             # Tu dong ket noi lai RP2040 o che do nen
@@ -248,12 +326,12 @@ def main():
                 if ser:
                     play_sound(True)
 
-            # Hotkey: PageDown -> Chuyen doi Vang (0) / Tim (1) / Do (2)
+            # Hotkey: PageDown -> Chuyen doi Vang (0) -> Tim (1) -> Do (2)
             pd_held = is_key_held(VK_PAGEDOWN)
             if pd_held and not page_down_was_held:
                 color_mode = (color_mode + 1) % 3
                 play_sound(True)
-                print(f"[COLOR] Chuyen sang mau: {HSV_PRESETS[color_mode]['name']}")
+                print(f"[COLOR] Chuyen sang mau: {COLOR_NAMES[color_mode]}")
             page_down_was_held = pd_held
 
             # Hotkey: `~ -> Bat/tat chan di chuyen A/D
@@ -289,8 +367,8 @@ def main():
                 time.sleep(0.001)
                 continue
 
-            # Quet mau bang mss + OpenCV HSV
-            target_found = detector.scan_for_color(region, color_mode)
+            # Quet mau bang mss + 3 Tang Uu Tien Chuan Du An Cu CVa
+            target_found = scanner.scan_for_color(region, color_mode)
 
             if target_found and now >= next_click_time:
                 if ser:
@@ -298,16 +376,13 @@ def main():
                         send_4byte_packet(ser, OP_CLICK, nonce)
                         nonce = (nonce + 1) & 0xFF
                         next_click_time = now + CLICK_PERIOD_SEC
-                        print(f"[CLICK] Muc tieu {HSV_PRESETS[color_mode]['name']} lot vao tam -> Ban click phan cung tai {now:.3f}s")
-                    except Exception as e:
-                        print(f"[ERROR] Loi gui Serial: {e}")
+                    except Exception:
                         ser = None
                 else:
-                    print(f"[CLICK] Phat hien muc tieu (RP2040 chua ket noi)")
                     next_click_time = now + CLICK_PERIOD_SEC
 
     finally:
-        detector.close()
+        scanner.close()
         if ser:
             ser.close()
 
