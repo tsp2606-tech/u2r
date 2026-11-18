@@ -39,7 +39,7 @@ SCAN_RADIUS = 25
 RECT_SIZE = SCAN_RADIUS * 2  # 50x50 pixel
 
 # Win32 Virtual Key Codes
-VK_RBUTTON = 0x02
+VK_LCONTROL= 0xA2  # Left Control
 VK_A       = 0x41
 VK_D       = 0x44
 VK_OEM_3   = 0xC0  # `~ Backtick
@@ -291,7 +291,7 @@ def main():
     page_up_was_held = False
 
     print("\n[PHIM TAT]")
-    print("  - Giu [Chuot Phai]: Quet mau & Tu dong ban bang phan cung")
+    print("  - Giu [Left Control]: Quet mau & Tu dong ban bang phan cung")
     print("  - [PageDown]: Chuyen doi mau (YELLOW -> PURPLE -> RED)")
     print("  - [`~] (Backtick): Bat/tat chan ban khi di chuyen A/D (Counter-strafe)")
     print("  - [PageUp]: Bat/tat gia toc chuot phan cung (Raw Accel)")
@@ -357,8 +357,8 @@ def main():
                         ser = None
             page_up_was_held = pu_held
 
-            # Kiem tra giu Chuot Phai (VK_RBUTTON)
-            if not is_key_held(VK_RBUTTON):
+            # Kiem tra giu Left Control (VK_LCONTROL)
+            if not is_key_held(VK_LCONTROL):
                 time.sleep(0.001)
                 continue
 
