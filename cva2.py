@@ -1,12 +1,16 @@
 """
-CVa 2 v2 — Python Controller for RP2040DongleV2
-Capture Engine: mss (Siêu nhẹ, không dùng BitBlt)
-Scanning Algorithm: Chuẩn 100% 3 Tầng Ưu Tiên Của Dự Án Cũ CVa
-  - Tầng 1: Tâm ngắm 3x3 px (Ưu tiên số 1)
-  - Tầng 2: Cột đầu dọc phía trên 24px (Upper Vertical Comb)
-  - Tầng 3: 16 tia Starburst tỏa tròn 360 độ (bảng tra Sin/Cos)
-Color Math: Đại số số nguyên không phép chia (Zero-Division Integer) nguyên bản CVa
-Zero-Jitter: Không flush buffer, không log nghẽn console, chuột lướt mượt 1000Hz tuyệt đối
+CVa 2 v2 — Pure Custom HID Controller for RP2040DongleV2
+Architecture: Single-Process, Zero-IPC, Pure USB HID (Usage Page 0xFF00, Usage 0x01)
+Hardware Target: Waveshare RP2040-Zero (VXE R1 SE+ Wireless Mouse Dongle)
+Features:
+  - 100% Pure USB HID: Hoàn toàn không mở cổng COM Serial, không hiện trong Ports (COM & LPT)
+  - Windows nhận diện thiết bị như chuột gaming thương mại (VXE, Razer, Logitech có Custom Vendor Interface)
+  - Đơn tiến trình (Single-Process): Xóa bỏ hoàn toàn Shared Memory, Named Event, không có tiến trình con
+  - Chụp màn hình qua mss (< 0.1ms, FOV 50x50), không dùng BitBlt hay DXGI hook
+  - Quét 3 tầng ưu tiên chuẩn CVa nguyên bản: Tâm 3x3 -> Cột đầu 24px -> 16 tia Starburst
+  - Đại số số nguyên không phép chia (Zero-Division Integer Algebra) trên kênh RGB
+  - Tự động thích nghi độ phân giải màn hình (16:9, 4:3 Stretched)
+  - Cáp USB hoàn toàn im lặng khi ngắm (0 byte/s), chỉ bắn 65-byte Output Report khi thấy mục tiêu
 """
 
 import sys
@@ -14,8 +18,6 @@ import time
 import math
 import ctypes
 from ctypes import wintypes
-import serial
-import serial.tools.list_ports
 import winsound
 import mss
 
@@ -39,7 +41,7 @@ SCAN_RADIUS = 25
 RECT_SIZE = SCAN_RADIUS * 2  # 50x50 pixel
 
 # Win32 Virtual Key Codes
-VK_LCONTROL= 0xA2  # Left Control
+VK_LCONTROL= 0xA2  # Left Control (Phím kích hoạt)
 VK_A       = 0x41
 VK_D       = 0x44
 VK_OEM_3   = 0xC0  # `~ Backtick
@@ -47,7 +49,42 @@ VK_END     = 0x23
 VK_PAGEUP  = 0x21
 VK_PAGEDOWN= 0x22
 
-user32 = ctypes.windll.user32
+user32   = ctypes.windll.user32
+kernel32 = ctypes.windll.kernel32
+hid_dll  = ctypes.windll.hid
+setupapi = ctypes.windll.setupapi
+
+# =========================================================================
+# Win32 HID Native Setup
+# =========================================================================
+class GUID(ctypes.Structure):
+    _fields_ = [
+        ('Data1', wintypes.DWORD),
+        ('Data2', wintypes.WORD),
+        ('Data3', wintypes.WORD),
+        ('Data4', wintypes.BYTE * 8)
+    ]
+
+class SP_DEVICE_INTERFACE_DATA(ctypes.Structure):
+    _fields_ = [
+        ('cbSize', wintypes.DWORD),
+        ('InterfaceClassGuid', GUID),
+        ('Flags', wintypes.DWORD),
+        ('Reserved', ctypes.c_size_t)
+    ]
+
+setupapi.SetupDiGetClassDevsW.restype = ctypes.c_void_p
+setupapi.SetupDiEnumDeviceInterfaces.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, wintypes.DWORD, ctypes.c_void_p]
+setupapi.SetupDiEnumDeviceInterfaces.restype = wintypes.BOOL
+setupapi.SetupDiGetDeviceInterfaceDetailW.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, wintypes.DWORD, ctypes.c_void_p, ctypes.c_void_p]
+setupapi.SetupDiGetDeviceInterfaceDetailW.restype = wintypes.BOOL
+setupapi.SetupDiDestroyDeviceInfoList.argtypes = [ctypes.c_void_p]
+setupapi.SetupDiDestroyDeviceInfoList.restype = wintypes.BOOL
+
+kernel32.CreateFileW.restype = ctypes.c_void_p
+kernel32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p]
+kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+hid_dll.HidD_SetOutputReport.argtypes = [ctypes.c_void_p, ctypes.c_void_p, wintypes.DWORD]
 
 # =========================================================================
 # Bảng Tra 16 Tia Starburst (Chuẩn 100% Dự Án Cũ CVa)
@@ -149,7 +186,6 @@ class CVa3TierScanner:
         }
 
     def scan_for_color(self, region, color_mode):
-        # Chụp vùng FOV 50x50 bằng mss siêu nhẹ
         shot = self.sct.grab(region)
         raw_bytes = shot.raw
         rect_size = self.rect_size
@@ -209,36 +245,54 @@ class CVa3TierScanner:
         self.sct.close()
 
 # =========================================================================
-# Giao Tiếp Phần Cứng Với RP2040 (Non-blocking, Không Flush, Không Khựng)
+# Giao Tiếp Độc Quyền Qua Custom HID (Zero-COM, Chuẩn Macro Chuột Thật)
 # =========================================================================
-def send_4byte_packet(ser, opcode, nonce):
+def find_rp2040_hid_device():
+    guid = GUID()
+    hid_dll.HidD_GetHidGuid(ctypes.byref(guid))
+    dev_info = setupapi.SetupDiGetClassDevsW(ctypes.byref(guid), None, None, 0x12)
+    if_data = SP_DEVICE_INTERFACE_DATA()
+    if_data.cbSize = ctypes.sizeof(SP_DEVICE_INTERFACE_DATA)
+    idx = 0
+    found_handle = None
+
+    while setupapi.SetupDiEnumDeviceInterfaces(dev_info, None, ctypes.byref(guid), idx, ctypes.byref(if_data)):
+        idx += 1
+        req_size = wintypes.DWORD()
+        setupapi.SetupDiGetDeviceInterfaceDetailW(dev_info, ctypes.byref(if_data), None, 0, ctypes.byref(req_size), None)
+        if req_size.value == 0: continue
+        buf = (ctypes.c_byte * req_size.value)()
+        ctypes.cast(buf, ctypes.POINTER(wintypes.DWORD))[0] = 8 if ctypes.sizeof(ctypes.c_void_p) == 8 else 6
+        if setupapi.SetupDiGetDeviceInterfaceDetailW(dev_info, ctypes.byref(if_data), buf, req_size, None, None):
+            path = ctypes.wstring_at(ctypes.addressof(buf) + 4)
+            path_lower = path.lower()
+            # Khớp định danh VXE R1 SE+ (VID: 0x248A, PID: 0x8367) hoặc EAGET (0x3936:0xE025)
+            if any(vid in path_lower for vid in ['vid_248a&pid_8367', 'vid_3936&pid_e025']):
+                for acc in [0xC0000000, 0x40000000, 0]: # Thử tuần tự quyền truy cập
+                    h = kernel32.CreateFileW(path, acc, 3, None, 3, 0, None)
+                    if h and h != 0xFFFFFFFFFFFFFFFF and h != -1:
+                        report = (ctypes.c_byte * 65)()
+                        report[1] = 0xAA
+                        if hid_dll.HidD_SetOutputReport(h, report, 65):
+                            found_handle = h
+                            break
+                        kernel32.CloseHandle(h)
+                if found_handle:
+                    break
+
+    setupapi.SetupDiDestroyDeviceInfoList(dev_info)
+    return found_handle
+
+def send_hid_packet(handle, opcode, nonce):
     enc_op = opcode ^ PROTO_KEY ^ nonce
     checksum = (PROTO_MAGIC + enc_op + nonce) & 0xFF
-    packet = bytes([PROTO_MAGIC, enc_op, nonce, checksum])
-    ser.write(packet)
-    # KHÔNG gọi ser.flush() để tránh block luồng CPU gây giật khựng chuột
-
-def find_and_connect_rp2040():
-    ports = sorted(
-        serial.tools.list_ports.comports(),
-        key=lambda p: int(p.device[3:]) if p.device.startswith("COM") and p.device[3:].isdigit() else 0,
-        reverse=True
-    )
-    for p in ports:
-        try:
-            s = serial.Serial(p.device, 115200, timeout=0.1, write_timeout=0.1)
-            time.sleep(0.03)
-            s.reset_input_buffer()
-            s.write(b"GET_STATUS\n")
-            time.sleep(0.04)
-            resp = s.read(128).decode("utf-8", errors="ignore")
-            if "STATUS_OK" in resp:
-                print(f"[HARDWARE] Da ket noi voi RP2040 tren {p.device} (Xac thuc thanh cong)")
-                return s
-            s.close()
-        except Exception:
-            pass
-    return None
+    report = (ctypes.c_byte * 65)()
+    report[0] = 0x00        # Report ID 0
+    report[1] = PROTO_MAGIC # 0xAA
+    report[2] = enc_op
+    report[3] = nonce
+    report[4] = checksum
+    return hid_dll.HidD_SetOutputReport(handle, report, 65) != 0
 
 def is_key_held(v_key):
     return (user32.GetAsyncKeyState(v_key) & 0x8000) != 0
@@ -254,12 +308,12 @@ COLOR_NAMES = {
 }
 
 # =========================================================================
-# Vòng Lặp Thực Thi Chính
+# Vòng Lặp Thực Thi Đơn Tiến Trình (Single-Process Loop, Zero-IPC)
 # =========================================================================
 def main():
     print("=" * 65)
-    print("  CVa 2 v2 — Python Controller (mss + Exact CVa 3-Tier Scan)")
-    print("  Hardware Target: Waveshare RP2040-Zero (VXE R1 SE+ Dongle)")
+    print("  CVa 2 v2 — Pure Custom HID Controller (Single-Process, Zero-IPC)")
+    print("  Hardware Target: VXE R1 SE+ Wireless Mouse (Pure USB HID 1000Hz)")
     print("=" * 65)
 
     screen_w = user32.GetSystemMetrics(0)
@@ -272,11 +326,12 @@ def main():
     region = scanner.get_grab_region(center_x, center_y)
     print(f"[CAPTURE] Khoi tao mss + CVa 3-Tier Scan (Vung FOV: {RECT_SIZE}x{RECT_SIZE} quanh tam, khong dung BitBlt)")
 
-    ser = find_and_connect_rp2040()
-    if ser:
+    hid_handle = find_rp2040_hid_device()
+    if hid_handle:
+        print("[HARDWARE] Da ket noi truc tiep qua Custom HID (Zero-COM Mode - San sang)")
         play_sound(True)
     else:
-        print("[WARNING] Chua tim thay mach RP2040. Tu dong do tim ngam...")
+        print("[WARNING] Chua tim thay thiet bi Custom HID. Tu dong do tim ngam...")
 
     color_mode = 0  # 0 = Yellow, 1 = Purple, 2 = Red
     block_ad = False
@@ -319,11 +374,12 @@ def main():
                     region = scanner.get_grab_region(center_x, center_y)
                     print(f"[SCREEN] Cap nhat do phan giai: {screen_w}x{screen_h} (Tam: {center_x}, {center_y})")
 
-            # Tu dong ket noi lai RP2040 o che do nen
-            if ser is None and now >= next_reconnect_time:
+            # Tu dong ket noi lai Custom HID neu mach bi rut ra cam lai
+            if hid_handle is None and now >= next_reconnect_time:
                 next_reconnect_time = now + 1.5
-                ser = find_and_connect_rp2040()
-                if ser:
+                hid_handle = find_rp2040_hid_device()
+                if hid_handle:
+                    print("[HARDWARE] Da ket noi lai qua Custom HID (San sang)")
                     play_sound(True)
 
             # Hotkey: PageDown -> Chuyen doi Vang (0) -> Tim (1) -> Do (2)
@@ -348,13 +404,13 @@ def main():
                 raw_accel = not raw_accel
                 play_sound(raw_accel)
                 print(f"[CONFIG] Gia toc chuot phan cung: {'BAT' if raw_accel else 'TAT'}")
-                if ser:
+                if hid_handle:
                     try:
                         op = OP_ACCEL_ON if raw_accel else OP_ACCEL_OFF
-                        send_4byte_packet(ser, op, nonce)
+                        send_hid_packet(hid_handle, op, nonce)
                         nonce = (nonce + 1) & 0xFF
                     except Exception:
-                        ser = None
+                        hid_handle = None
             page_up_was_held = pu_held
 
             # Kiem tra giu Left Control (VK_LCONTROL)
@@ -371,20 +427,23 @@ def main():
             target_found = scanner.scan_for_color(region, color_mode)
 
             if target_found and now >= next_click_time:
-                if ser:
+                if hid_handle:
                     try:
-                        send_4byte_packet(ser, OP_CLICK, nonce)
+                        ok = send_hid_packet(hid_handle, OP_CLICK, nonce)
+                        if not ok:
+                            kernel32.CloseHandle(hid_handle)
+                            hid_handle = None
                         nonce = (nonce + 1) & 0xFF
                         next_click_time = now + CLICK_PERIOD_SEC
                     except Exception:
-                        ser = None
+                        hid_handle = None
                 else:
                     next_click_time = now + CLICK_PERIOD_SEC
 
     finally:
         scanner.close()
-        if ser:
-            ser.close()
+        if hid_handle:
+            kernel32.CloseHandle(hid_handle)
 
 if __name__ == "__main__":
     main()
