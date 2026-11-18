@@ -16,16 +16,20 @@ Features:
 import sys
 import time
 import math
+import random
 import ctypes
 from ctypes import wintypes
 import winsound
 import mss
 
-# Khắc phục Windows DPI Scaling
+# Khắc phục Windows DPI Scaling chuẩn Per-Monitor V2
 try:
-    ctypes.windll.user32.SetProcessDPIAware()
+    ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
 except Exception:
-    pass
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
 
 # =========================================================================
 # Protocol Constants (Khớp 100% với rp2040donglev2.ino)
@@ -42,6 +46,7 @@ RECT_SIZE = SCAN_RADIUS * 2  # 50x50 pixel
 
 # Win32 Virtual Key Codes
 VK_LCONTROL= 0xA2  # Left Control (Phím kích hoạt)
+VK_INSERT  = 0x2D  # Phím Insert (Bật/Tắt phản xạ sinh học)
 VK_A       = 0x41
 VK_D       = 0x44
 VK_OEM_3   = 0xC0  # `~ Backtick
@@ -336,6 +341,8 @@ def main():
     color_mode = 0  # 0 = Yellow, 1 = Purple, 2 = Red
     block_ad = False
     raw_accel = False
+    humanized_delay_enabled = False  # Mặc định TẮT (Ins để Bật/Tắt)
+    target_first_seen_time = None
     nonce = 1
     next_click_time = 0.0
     next_reconnect_time = 0.0
@@ -344,14 +351,17 @@ def main():
     page_down_was_held = False
     backtick_was_held = False
     page_up_was_held = False
+    insert_was_held = False
 
     print("\n[PHIM TAT]")
     print("  - Giu [Left Control]: Quet mau & Tu dong ban bang phan cung")
+    print("  - [Insert]: Bat/Tat phan xa sinh hoc con nguoi (Mac dinh: TAT)")
     print("  - [PageDown]: Chuyen doi mau (YELLOW -> PURPLE -> RED)")
     print("  - [`~] (Backtick): Bat/tat chan ban khi di chuyen A/D (Counter-strafe)")
     print("  - [PageUp]: Bat/tat gia toc chuot phan cung (Raw Accel)")
     print("  - [End]: Tat chuong trinh\n")
     print(f"[READY] Mau dang chon: {COLOR_NAMES[color_mode]}")
+    print(f"[READY] Phan xa sinh hoc (Insert): {'BAT' if humanized_delay_enabled else 'TAT (<1ms)'}")
 
     try:
         while True:
@@ -381,6 +391,14 @@ def main():
                 if hid_handle:
                     print("[HARDWARE] Da ket noi lai qua Custom HID (San sang)")
                     play_sound(True)
+
+            # Hotkey: Insert -> Bat/Tat phan xa sinh hoc tu nhien (Mac dinh TAT)
+            ins_held = is_key_held(VK_INSERT)
+            if ins_held and not insert_was_held:
+                humanized_delay_enabled = not humanized_delay_enabled
+                play_sound(humanized_delay_enabled)
+                print(f"[BEHAVIOR] Phan xa sinh hoc (Insert): {'BAT (120-175ms Delay)' if humanized_delay_enabled else 'TAT (<1ms Instant)'}")
+            insert_was_held = ins_held
 
             # Hotkey: PageDown -> Chuyen doi Vang (0) -> Tim (1) -> Do (2)
             pd_held = is_key_held(VK_PAGEDOWN)
@@ -415,30 +433,44 @@ def main():
 
             # Kiem tra giu Left Control (VK_LCONTROL)
             if not is_key_held(VK_LCONTROL):
-                time.sleep(0.001)
+                time.sleep(0.010)  # Nghi 10ms khi khong ngam de giam 90% syscall GetAsyncKeyState
+                target_first_seen_time = None
                 continue
 
             # Chan ban neu dang di chuyen A hoac D
             if block_ad and (is_key_held(VK_A) or is_key_held(VK_D)):
                 time.sleep(0.001)
+                target_first_seen_time = None
                 continue
 
             # Quet mau bang mss + 3 Tang Uu Tien Chuan Du An Cu CVa
             target_found = scanner.scan_for_color(region, color_mode)
 
-            if target_found and now >= next_click_time:
-                if hid_handle:
-                    try:
-                        ok = send_hid_packet(hid_handle, OP_CLICK, nonce)
-                        if not ok:
-                            kernel32.CloseHandle(hid_handle)
+            if target_found:
+                if target_first_seen_time is None:
+                    if humanized_delay_enabled:
+                        # Mo phong phan xa sinh hoc mat -> tay nguoi that dao dong 120ms - 175ms
+                        target_first_seen_time = now + random.uniform(0.120, 0.175)
+                    else:
+                        target_first_seen_time = now
+
+                if now >= target_first_seen_time and now >= next_click_time:
+                    if hid_handle:
+                        try:
+                            ok = send_hid_packet(hid_handle, OP_CLICK, nonce)
+                            if not ok:
+                                kernel32.CloseHandle(hid_handle)
+                                hid_handle = None
+                            nonce = (nonce + 1) & 0xFF
+                            # Cooldown ngau nhien neu bat che do sinh hoc
+                            cd = random.uniform(0.055, 0.080) if humanized_delay_enabled else CLICK_PERIOD_SEC
+                            next_click_time = now + cd
+                        except Exception:
                             hid_handle = None
-                        nonce = (nonce + 1) & 0xFF
+                    else:
                         next_click_time = now + CLICK_PERIOD_SEC
-                    except Exception:
-                        hid_handle = None
-                else:
-                    next_click_time = now + CLICK_PERIOD_SEC
+            else:
+                target_first_seen_time = None
 
     finally:
         scanner.close()
